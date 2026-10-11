@@ -86,6 +86,12 @@ def find_metadata_file(folder):
         return 'metadata.json'
     return names[0] if names else None
 
+def find_data_files(folder):
+    return sorted(n for n in os.listdir(folder) if n.lower().endswith(('.bw', '.json')) and n.lower() != 'metadata.json' and os.path.isfile(os.path.join(folder, n)))
+
+def is_item_folder(folder):
+    return os.path.isfile(os.path.join(folder, 'metadata.json')) or len([n for n in os.listdir(folder) if n.lower().endswith('.bw')]) == 1
+
 def read_json(path):
     with open(path, encoding='utf-8') as handle:
         return json.load(handle)
@@ -101,12 +107,33 @@ def block_signature(blocks):
         digest.update(b'\x00')
     return digest.hexdigest()
 
+def kind_of(payload):
+    if isinstance(payload, dict) and isinstance(payload.get('blocks'), list):
+        return 'world'
+    if isinstance(payload, list) and payload and all(isinstance(block, dict) and 'tile-rows' in block for block in payload):
+        return 'model'
+    return None
+
+def unwrap(raw):
+    text = raw.decode('utf-8-sig')
+    record = json.loads(text)
+    if isinstance(record, dict) and isinstance(record.get('source_json_str'), str):
+        return record.pop('source_json_str').encode('utf-8'), record
+    return text.encode('utf-8'), {}
+
+def escape(match):
+    return ''.join(f'\\u{unit}' for unit in re.findall('....', match.group().encode('utf-16-be').hex().upper()))
+
+def ascii_only(plain):
+    return re.sub(r'[^\x00-\x7f]', escape, plain.decode('utf-8')).encode('ascii')
+
 class Item:
-    def __init__(self, path, bw_name, metadata_name, metadata, payload):
+    def __init__(self, path, data_name, metadata_name, metadata, payload, form='folder'):
         self.path = path
-        self.bw_name = bw_name
+        self.data_name = data_name
         self.metadata_name = metadata_name
         self.metadata = metadata
+        self.form = form
         self.kind = 'model' if isinstance(payload, list) else 'world'
         blocks = payload if self.kind == 'model' else payload.get('blocks', [])
         self.block_count = len(blocks)
@@ -115,22 +142,46 @@ class Item:
         if self.kind == 'world':
             self.problems = [f'{key} does not match the block count' for key in PARALLEL_KEYS if len(payload.get(key, [])) != len(blocks)]
         self.title = (metadata.get('title') or '').strip() or 'Untitled'
-        self.author_id = metadata['author_id']
+        self.author_id = metadata.get('author_id')
         self.updated_at = metadata.get('updated_at') or ''
 
-def load_item(folder):
-    bw_name = find_bw_file(folder)
-    if bw_name is None:
+def load_path(path):
+    if os.path.isfile(path):
+        return load_item(os.path.dirname(path), os.path.basename(path), None, 'file')
+    item, reason = load_item(path, find_bw_file(path) or next(iter(find_data_files(path)), None), find_metadata_file(path))
+    if item is None and reason is None:
+        reason = 'no world or model data in it'
+    return item, reason
+
+def load_item(folder, data_name, metadata_name, form='folder'):
+    if data_name is None:
         return None, 'no .bw file'
-    with open(os.path.join(folder, bw_name), 'rb') as handle:
+    with open(os.path.join(folder, data_name), 'rb') as handle:
         raw = handle.read()
     metadata = {}
-    metadata_name = find_metadata_file(folder)
     if metadata_name:
         try:
             metadata = read_json(os.path.join(folder, metadata_name))
         except Exception:
             metadata = {}
+    if form == 'file':
+        stem = os.path.splitext(data_name)[0]
+        stamp = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(folder, data_name))).strftime('%Y-%m-%dT%H:%M:%S')
+        metadata = {'title': '' if stem.lower() == 'source' else stem, 'created_at': stamp, 'updated_at': stamp}
+    if raw[:2] != MAGIC:
+        try:
+            plain, record = unwrap(raw)
+        except Exception:
+            return None, None
+        try:
+            payload = json.loads(plain.decode('utf-8'))
+        except Exception:
+            return None, 'its world or model data does not read' if record else None
+        if kind_of(payload) is None:
+            return None, None
+        if record:
+            metadata, form = record, 'ios'
+        return Item(folder, data_name, metadata_name, metadata, payload, form), None
     payload = None
     if metadata.get('author_id') is not None:
         try:
@@ -143,7 +194,14 @@ def load_item(folder):
             return None, 'cannot tell which account this belongs to'
         metadata['author_id'] = recovered
         payload = json.loads(decrypt(raw, recovered).decode('utf-8'))
-    return Item(folder, bw_name, metadata_name, metadata, payload), None
+    return Item(folder, data_name, metadata_name, metadata, payload, form), None
+
+def read_plain(source):
+    with open(os.path.join(source.path, source.data_name), 'rb') as handle:
+        raw = handle.read()
+    if raw[:2] == MAGIC:
+        return decrypt(raw, source.author_id)
+    return ascii_only(unwrap(raw)[0])
 
 def progress(label, done, total):
     width = 30
@@ -154,19 +212,23 @@ def progress(label, done, total):
         log(f'  {label:<16} {total} read', screen=False)
 
 def scan_library(root, label=None):
-    if find_bw_file(root):
-        item, reason = load_item(root)
-        return ([item], []) if item else ([], [(os.path.basename(root), reason)])
+    if os.path.isfile(root) or is_item_folder(root):
+        item, reason = load_path(root)
+        return ([item], []) if item else ([], [(os.path.basename(root), reason)] if reason else [])
+    names = find_data_files(root)
     folders = [os.path.join(root, name) for name in sorted(os.listdir(root)) if os.path.isdir(os.path.join(root, name))]
+    if names:
+        folders = [folder for folder in folders if is_item_folder(folder)]
+    paths = [os.path.join(root, name) for name in names] + folders
     items, unreadable = [], []
-    for number, folder in enumerate(folders, 1):
-        item, reason = load_item(folder)
-        if item is None:
-            unreadable.append((os.path.basename(folder), reason))
-        else:
+    for number, path in enumerate(paths, 1):
+        item, reason = load_path(path)
+        if item is not None:
             items.append(item)
+        elif reason:
+            unreadable.append((os.path.basename(path), reason))
         if label:
-            progress(label, number, len(folders))
+            progress(label, number, len(paths))
     return items, unreadable
 
 def looks_like_library(folder):
@@ -181,16 +243,18 @@ def looks_like_library(folder):
 
 def libraries_under(path):
     path = os.path.abspath(path)
+    if os.path.isfile(path):
+        return [path]
     if not os.path.isdir(path):
         return []
-    if find_bw_file(path):
+    if is_item_folder(path):
         return [path]
     if os.path.basename(path).lower() in ('worlds', 'models'):
         return [path]
     children = [os.path.join(path, name) for name in ('worlds', 'models') if os.path.isdir(os.path.join(path, name))]
     if children:
         return children
-    if looks_like_library(path):
+    if looks_like_library(path) or find_data_files(path):
         return [path]
     return []
 
@@ -249,27 +313,31 @@ def describe_account(folder):
     account = authors.most_common(1)[0][0] if authors else 'unknown'
     return f'{label_for(folder) or "Folder"}   account {account}   {", ".join(counts)}\n     {folder}'
 
-def browse():
+def browse(files=False):
     try:
         import tkinter
         from tkinter import filedialog
         root = tkinter.Tk()
         root.withdraw()
         root.attributes('-topmost', True)
-        picked = filedialog.askdirectory(title='Pick an account folder, a worlds or models folder, or a single world or model')
+        if files:
+            picked = filedialog.askopenfilename(title='Pick a world or model file', filetypes=[('World or model files', '*.bw *.json'), ('All files', '*.*')])
+        else:
+            picked = filedialog.askdirectory(title='Pick an account folder, a worlds or models folder, or a single world or model')
         root.destroy()
         return picked or None
     except Exception:
         try:
-            return input('paste the folder path: ').strip().strip('"') or None
+            return input('paste the file path: ' if files else 'paste the folder path: ').strip().strip('"') or None
         except EOFError:
             return None
 
-def choose(prompt, options, what, default=None):
+def choose(prompt, options, what, default=None, files=False):
+    browsing = f'browse for {what} (b)' + (' or a single file (f)' if files else '')
     if default:
-        hint = f'Enter for {options.index(default) + 1}, or browse for {what} (b)'
+        hint = f'Enter for {options.index(default) + 1}, or {browsing}'
     else:
-        hint = ('1 or ' if len(options) == 1 else f'1-{len(options)} or ' if options else '') + f'browse for {what} (b)'
+        hint = ('1 or ' if len(options) == 1 else f'1-{len(options)} or ' if options else '') + browsing
     while True:
         try:
             answer = input(f'{prompt} [{hint}]: ').strip()
@@ -280,15 +348,18 @@ def choose(prompt, options, what, default=None):
             return default
         if answer.isdigit() and options and 1 <= int(answer) <= len(options):
             return options[int(answer) - 1]
-        if answer.lower() in ('b', 'browse'):
-            picked = browse()
+        if answer.lower() in ('b', 'browse') or (files and answer.lower() == 'f'):
+            picked = browse(answer.lower() == 'f')
             if picked:
                 log(f'> {picked}', screen=False)
                 return picked
             continue
-        if os.path.isdir(answer.strip('"')):
+        if os.path.isdir(answer.strip('"')) or (files and os.path.isfile(answer.strip('"'))):
             return answer.strip('"')
-        log(f'  type a number from 1 to {len(options)}, b to browse, or paste a folder path' if options else '  type b to browse, or paste a folder path')
+        if files:
+            log(f'  type a number from 1 to {len(options)}, {browsing}, or paste a path' if options else f'  type b to browse for {what}, f for a single file, or paste a path')
+        else:
+            log(f'  type a number from 1 to {len(options)}, b to browse, or paste a folder path' if options else '  type b to browse, or paste a folder path')
 
 def game_is_running():
     try:
@@ -313,9 +384,13 @@ def world_metadata(template, source, destination, author_id, picture):
     metadata['local_world_id'] = os.path.basename(destination)
     metadata['title'] = source.title
     metadata['description'] = source.metadata.get('description') or ''
-    for field in ('remixed_from_author_id', 'remixed_from_author_username', 'is_downloaded_copy'):
+    for field in ('remixed_from_author_id', 'remixed_from_author_username', 'is_downloaded_copy', 'has_win_condition'):
         if field in source.metadata:
             metadata[field] = source.metadata[field]
+    for field, value in (('publication_status', 5), ('play_count', 0), ('likes_count', 0), ('downloads_count', 0), ('average_star_rating', 0)):
+        if field in metadata:
+            metadata[field] = value
+    metadata['screenshot_taken_manually'] = (source.metadata.get('screenshot_taken_manually') or 0) if picture else 0
     metadata['block_count'] = source.block_count
     metadata['created_at'] = source.metadata.get('created_at') or now()
     metadata['updated_at'] = source.updated_at or now()
@@ -339,6 +414,8 @@ def model_metadata(template, source, destination, author_id, picture):
             metadata[field] = template[field]
     metadata['fileId'] = 0
     metadata['ugcId'] = 0
+    if 'publication_status' in metadata:
+        metadata['publication_status'] = 0
     metadata['local_id'] = os.path.basename(destination)
     metadata['title'] = source.title
     metadata['short_title'] = source.title[:32]
@@ -356,7 +433,14 @@ def find_picture(folder, stems):
             size = os.stat(os.path.join(folder, name)).st_size
             if best is None or size > best[1]:
                 best = (name, size)
-    return best[0] if best else None
+    return os.path.join(folder, best[0]) if best else None
+
+def find_ios_picture(folder, item_id):
+    if not item_id:
+        return None
+    pattern = glob.escape(str(item_id)) + '_image_*'
+    found = glob.glob(os.path.join(glob.escape(folder), pattern)) + glob.glob(os.path.join(glob.escape(folder), '*', pattern))
+    return max(found, key=os.path.getsize) if found else None
 
 def copy_times(source_path, destination_path):
     try:
@@ -368,9 +452,7 @@ def copy_times(source_path, destination_path):
 def transfer(source, library, author_id, template):
     if source.problems:
         raise RuntimeError('; '.join(source.problems))
-    with open(os.path.join(source.path, source.bw_name), 'rb') as handle:
-        raw = handle.read()
-    plain = decrypt(raw, source.author_id)
+    plain = read_plain(source)
     payload = encrypt(plain, author_id)
     if decrypt(payload, author_id) != plain:
         raise RuntimeError('re-encryption did not round trip')
@@ -380,14 +462,18 @@ def transfer(source, library, author_id, template):
         target = os.path.join(destination, 'source.bw')
         with open(target, 'wb') as handle:
             handle.write(payload)
-        stems = ('screenshot',) if source.kind == 'world' else ('image', 'iconhd', 'iconsd')
-        picture = find_picture(source.path, stems)
+        if source.form == 'folder':
+            picture = find_picture(source.path, ('screenshot',) if source.kind == 'world' else ('image', 'iconhd', 'iconsd'))
+        elif source.form == 'ios' and source.kind == 'world':
+            picture = find_ios_picture(source.path, source.metadata.get('id'))
+        else:
+            picture = None
         picture_path = None
         if picture:
             base = 'screenshot' if source.kind == 'world' else 'iconHD'
             picture_path = os.path.join(destination, base + os.path.splitext(picture)[1].lower())
-            shutil.copyfile(os.path.join(source.path, picture), picture_path)
-            copy_times(os.path.join(source.path, picture), picture_path)
+            shutil.copyfile(picture, picture_path)
+            copy_times(picture, picture_path)
         builder = world_metadata if source.kind == 'world' else model_metadata
         metadata = builder(template, source, destination, author_id, picture_path)
         metadata_path = os.path.join(destination, 'metadata.json')
@@ -396,15 +482,14 @@ def transfer(source, library, author_id, template):
             written = handle.read()
         if written != payload:
             raise RuntimeError('the written file does not match')
-        check, _ = load_item(destination)
+        check, _ = load_path(destination)
         if check is None or check.signature != source.signature:
             raise RuntimeError('verification failed after writing')
-        copy_times(os.path.join(source.path, source.bw_name), target)
-        if source.metadata_name:
-            copy_times(os.path.join(source.path, source.metadata_name), metadata_path)
-        copy_times(source.path, destination)
+        copy_times(os.path.join(source.path, source.data_name), target)
+        copy_times(os.path.join(source.path, source.metadata_name or source.data_name), metadata_path)
+        copy_times(source.path if source.form == 'folder' else os.path.join(source.path, source.data_name), destination)
         return destination
-    except Exception:
+    except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
         raise
 
@@ -432,9 +517,14 @@ def newest_only(items):
     return list(newest.values())
 
 def describe_side(path, items):
-    label = label_for(path)
-    author_id = collections.Counter(item.author_id for item in items).most_common(1)[0][0]
+    label = 'iOS' if any(item.form == 'ios' for item in items) else label_for(path)
+    authors = collections.Counter(item.author_id for item in items if item.author_id is not None)
+    author_id = authors.most_common(1)[0][0] if authors else 'unknown'
     return f'{label + ", " if label else ""}account {author_id}', os.path.abspath(path)
+
+def describe_count(items):
+    counts = collections.Counter(item.kind for item in items)
+    return ' and '.join(f'{counts[kind]} {kind}{"" if counts[kind] == 1 else "s"}' for kind in ('world', 'model') if counts[kind])
 
 def ask(question, choices):
     while True:
@@ -466,14 +556,14 @@ def pick_accounts():
         log()
     log('world data and model data are ready to be transferred')
     log('select a destination account, then select the account with the data you want to transfer from')
-    log('or b to browse, letting you import single world/model folders, or another folder containing your world/model data')
+    log('or browse to import single world/model folders or files, or another folder containing your data')
     log()
     destination_path = choose('select a destination account to transfer your data into', accounts, 'destination')
     default = accounts[1 - accounts.index(destination_path)] if len(accounts) == 2 and destination_path in accounts else None
-    source_path = choose('which account has the data you want to transfer from?', accounts, 'data', default)
+    source_path = choose('which account has the data you want to transfer from?', accounts, 'a data folder', default, True)
     while source_path == destination_path:
-        log('  that is the same account, pick a different one or b to browse')
-        source_path = choose('which account has the data you want to transfer from?', accounts, 'data', default)
+        log('  that is the same account, pick a different one, or browse for a data folder (b) or a single file (f)')
+        source_path = choose('which account has the data you want to transfer from?', accounts, 'a data folder', default, True)
     return source_path, destination_path
 
 def plan(source_path, destination_path):
@@ -482,7 +572,7 @@ def plan(source_path, destination_path):
     overlap = set(map(os.path.normcase, source_libraries)) & set(map(os.path.normcase, destination_libraries))
     if overlap:
         sys.exit('the destination and the folder to copy from are the same place')
-    if any(find_bw_file(library) for library in destination_libraries):
+    if any(os.path.isfile(library) or is_item_folder(library) or find_data_files(library) for library in destination_libraries):
         sys.exit('the destination must be an account folder or a worlds or models folder, not a single world or model')
 
     source_items, unreadable = [], []
@@ -494,9 +584,9 @@ def plan(source_path, destination_path):
         sys.exit('nothing readable to copy from')
 
     present, destination_items = index_destination(destination_libraries)
-    if not destination_items:
+    author_counts = collections.Counter(item.author_id for item in destination_items if item.author_id is not None)
+    if not author_counts:
         sys.exit('the destination is empty; save one world or model in that game first, the tool copies how the game lays out its files from an existing one')
-    author_counts = collections.Counter(item.author_id for item in destination_items)
     author_id = author_counts.most_common(1)[0][0]
 
     templates, libraries_by_kind = {}, {}
@@ -509,10 +599,13 @@ def plan(source_path, destination_path):
             if found:
                 templates[kind] = found[0].metadata
 
-    pending, skipped = [], collections.Counter()
+    pending, skipped, damaged = [], collections.Counter(), []
     for item in newest_only(source_items):
         if item.signature in present:
             skipped['already in the destination account'] += 1
+        elif item.problems:
+            skipped['damaged, its block lists do not match'] += 1
+            damaged.append(item)
         elif item.kind not in templates:
             skipped[f'the destination account has no {item.kind} yet to copy the file layout from'] += 1
         else:
@@ -531,8 +624,10 @@ def plan(source_path, destination_path):
         log(f'  {item.kind:<6} {item.title[:44]:<44} {item.block_count:>8,} blocks')
     for reason, count in sorted(skipped.items()):
         log(f'  skipping {count}: {reason}')
+    for item in damaged:
+        log(f'    {item.title}: {"; ".join(item.problems)}', screen=False)
     if unreadable:
-        log(f'  skipping {len(unreadable)} empty or unfinished folder{"" if len(unreadable) == 1 else "s"}')
+        log(f'  skipping {len(unreadable)} empty or unreadable item{"" if len(unreadable) == 1 else "s"}')
         for name, reason in unreadable:
             log(f'    {name}: {reason}', screen=False)
     return pending, libraries_by_kind, templates, author_id
@@ -549,7 +644,7 @@ def main():
             if not pending:
                 log('nothing to do')
                 return
-            if not confirm(f'transfer {len(pending)} item(s)?'):
+            if not confirm(f'transfer {describe_count(pending)}?'):
                 sys.exit('aborted')
             break
         if not pending:
@@ -557,7 +652,7 @@ def main():
                 return
             log()
             continue
-        answer = ask(f'transfer {len(pending)} item(s)? y to transfer, n to quit, r to pick the accounts again', ('y', 'n', 'r'))
+        answer = ask(f'transfer {describe_count(pending)}? y to transfer, n to quit, r to pick the accounts again', ('y', 'n', 'r'))
         if answer == 'y':
             break
         if answer == 'n':
@@ -570,22 +665,22 @@ def main():
     if running is None and not confirm('could not check whether Blocksworld is running, make sure it is closed.'):
         sys.exit('aborted')
 
-    done = failed = 0
+    done, failed = [], 0
     for number, item in enumerate(pending, 1):
         count = f'{number}/{len(pending)}'
         try:
             destination = transfer(item, libraries_by_kind[item.kind], author_id, templates[item.kind])
-            done += 1
+            done.append(item)
             log(f'  ok     {count:>9}  {item.title[:44]:<44} -> {os.path.basename(destination)}')
         except Exception as error:
             failed += 1
-            log(f'  FAILED {count:>9}  {item.title}: {error}')
+            log(f'  FAILED {count:>9}  {item.title}: {str(error) or type(error).__name__}')
 
     log()
     if failed:
-        log(f'Finished with problems: {done} transferred, {failed} failed. The failures are listed above and in transfer.log.')
+        log(f'Finished with problems: {len(done)} transferred, {failed} failed. The failures are listed above and in transfer.log.')
     else:
-        log(f'Task finished. {done} item{"" if done == 1 else "s"} transferred and verified. Start Blocksworld to see {"it" if done == 1 else "them"}.')
+        log(f'Task finished. {describe_count(done)} transferred and verified. Start Blocksworld to see {"it" if len(done) == 1 else "them"}.')
 
 if __name__ == '__main__':
     sys.stdout.reconfigure(errors='replace')

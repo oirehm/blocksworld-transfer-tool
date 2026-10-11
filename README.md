@@ -2,7 +2,7 @@
 
 Moves your [Blocksworld](https://store.steampowered.com/app/642390/Blocksworld/) worlds and models from one account folder to another, even across different builds of the game.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/oirehm/blocksworld-transfer-tool/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/oirehm/blocksworld-transfer-tool/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ## Requirements
@@ -26,7 +26,7 @@ Make sure Blocksworld is closed, then run `transfer.py`:
 python transfer.py
 ```
 
-It finds your accounts and asks which one to transfer into, then which one has the data to be transferred. Type `b` at either question to browse for a folder instead, or pass both paths yourself. Each can be an account folder (shown below) or a single `worlds` or `models` folder, and the one you copy from can also be a single world or model folder:
+It finds your accounts and asks which one to transfer into, then which one has the data to be transferred. Type `b` at either question to browse for a folder instead, `f` at the second to pick a single file, or pass both paths yourself. Each can be an account folder (shown below) or a single `worlds` or `models` folder. The one you copy from can also be a single world or model, or any folder holding them:
 
 ```
 python transfer.py "C:\path\to\copy\from" "C:\path\to\copy\into"
@@ -42,17 +42,19 @@ Playtest   %USERPROFILE%\AppData\LocalLow\Fortell Games\Blocksworld\blocksworld_
 
 If your Documents folder lives in OneDrive, the first two start with `%USERPROFILE%\OneDrive` instead.
 
+The iOS app keeps each world and model as a single file, `user_world_<id>.json` or `user_model_<id>.json`, instead of a folder. Copy the app's files off the device with a tool that can export app data, then pick the folder holding those files as the one to copy from. Worlds and models saved as plain JSON, in a `.bw` or `.json` file, work the same way.
+
 The destination account needs at least one saved world to receive worlds, and one saved model to receive models, because the tool copies how the game lays out its files from an existing one.
 
 ## Data Handling
 
-BTT is a local tool and does not connect to the internet. The tool checks a fixed list of folders where the game keeps its library, under your user folder, and only reads and writes in your BW folders.
+BTT is a local tool and does not connect to the internet. The tool checks a fixed list of folders where the game keeps its library, under your user folder. It only reads those and the folders or files you pick, and only writes in your BW folders.
 
 ## FAQ
 
 **Can this break my worlds/models?**
 
-No. The account you copy from is only read from. Each world or model is written as a new folder in the destination account. There is nothing this tool can do to delete existing data.
+No. Whatever you copy from is only read from. Each world or model is written as a new folder in the destination account. There is nothing this tool can do to delete existing data.
 
 **How do I undo a transfer?**
 
@@ -64,11 +66,11 @@ Yes. All three save a world or model the same way, and the data inside has staye
 
 **Does it work with the iOS version?**
 
-Not yet. The iOS app stores its files differently than the PC versions. Copying iOS worlds to PC is planned for a future version.
+Yes, from iOS to PC. The iOS app stores its files differently than the PC versions, so copy them off the device first, as described in Usage. Copying back onto iOS is not supported yet.
 
 **Someone sent me a world/model. How do I transfer only that?**
 
-Type `b` or `browse` at the second question asking which account has the data, and select the world/model folder. Or pass the folder as the first path when run via terminal.
+At the second question that asks which account has the data, type `b` to select the world or model folder, or `f` to select a single file. Or pass the folder or file as the first path when run via terminal.
 
 **A world I already transferred is offered again. Why?**
 
