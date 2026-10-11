@@ -58,9 +58,13 @@ No. The account you copy from is only read from. Each world or model is written 
 
 If you have not started the game since the transfer, just delete the transferred folders. Once the game has seen it, delete the world inside the game instead, as it is saved on the server and comes back if you only delete the files.
 
-**Does it work with the original game, iOS data, and the playtest?**
+**Does it work across the PC versions: the original game (BW1), the community version (BW2), and the playtest?**
 
-Yes. The file format has not changed since 2013 (as of 2026), so any build's worlds can open in any other, and transfers work in both directions, including moving playtest worlds back into the original game, though blocks or tiles the playtest added since will not exist there. iOS worlds work too once the folder is copied off the phone.
+Yes. All three save a world or model the same way, and the data inside has stayed the same since 2013. Transfers work in any direction between them, including moving playtest worlds back into BW1 or BW2, though blocks or tiles the playtest added since will not exist there.
+
+**Does it work with the iOS version?**
+
+Not yet. The iOS app stores its files differently than the PC versions. Copying iOS worlds to PC is planned for a future version.
 
 **Someone sent me a world/model. How do I transfer only that?**
 
